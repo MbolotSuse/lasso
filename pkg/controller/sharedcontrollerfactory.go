@@ -2,10 +2,12 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
 	"github.com/rancher/lasso/pkg/cache"
 	"github.com/rancher/lasso/pkg/client"
+	"github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -48,6 +50,9 @@ type sharedControllerFactory struct {
 
 	sharedCacheFactory cache.SharedCacheFactory
 	controllers        map[schema.GroupVersionResource]*sharedController
+	// controllerCancels holds the functions to cancel the contexts for the controllers
+	controllerCancels map[schema.GroupVersionResource]func()
+	cfg               *rest.Config
 
 	rateLimiter     workqueue.RateLimiter
 	workers         int
@@ -88,6 +93,8 @@ func NewSharedControllerFactory(cacheFactory cache.SharedCacheFactory, opts *Sha
 	return &sharedControllerFactory{
 		sharedCacheFactory:     cacheFactory,
 		controllers:            map[schema.GroupVersionResource]*sharedController{},
+		controllerCancels:      map[schema.GroupVersionResource]func(){},
+		cfg:                    cacheFactory.SharedClientFactory().RestConfig(),
 		workers:                opts.DefaultWorkers,
 		kindWorkers:            opts.KindWorkers,
 		rateLimiter:            opts.DefaultRateLimiter,
@@ -137,12 +144,18 @@ func (s *sharedControllerFactory) Start(ctx context.Context, defaultWorkers int)
 		if err != nil {
 			return err
 		}
-		if err := controller.Start(ctx, w); err != nil {
+		newCtx, cancelFunc := context.WithCancel(ctx)
+		s.controllerCancels[gvr] = cancelFunc
+		if err := controller.Start(newCtx, w); err != nil {
 			return err
 		}
 	}
-
-	return nil
+	// unlock to watch for the GVKs
+	s.controllerLock.Unlock()
+	// re-lock so that the deferred unlock doesn't panic
+	defer s.controllerLock.Lock()
+	err := s.watchGVKS(ctx, s.updateControllers)
+	return err
 }
 
 func (s *sharedControllerFactory) ForObject(obj runtime.Object) (SharedController, error) {
@@ -255,4 +268,38 @@ func (s *sharedControllerFactory) byResource(gvr schema.GroupVersionResource) *s
 
 func (s *sharedControllerFactory) SharedCacheFactory() cache.SharedCacheFactory {
 	return s.sharedCacheFactory
+}
+
+// updateControllers cancels/removes old controllers which are for removed api groups.
+func (s *sharedControllerFactory) updateControllers(newGVRs []schema.GroupVersionResource) error {
+	s.controllerLock.Lock()
+	defer s.controllerLock.Unlock()
+	// convert to a map for easy lookup. TODO: Change input to a map to not do this here?
+	lookup := map[schema.GroupVersionResource]struct{}{}
+	for _, gvr := range newGVRs {
+		lookup[gvr] = struct{}{}
+	}
+
+	// identify GVRs which are no longer present. Record in separate list to avoid changing map during iteration
+	var removeGVRs []schema.GroupVersionResource
+	for oldGVR, _ := range s.controllerCancels {
+		if _, ok := lookup[oldGVR]; !ok {
+			removeGVRs = append(removeGVRs, oldGVR)
+		}
+	}
+
+	for _, removeGVR := range removeGVRs {
+		cancelFunc, ok := s.controllerCancels[removeGVR]
+		if !ok {
+			return fmt.Errorf("unable to cancel context for GVR %s", removeGVR.String())
+		}
+		// cancelFunc instructs the controller to gracefully shut down. Once shut down, we remove from the map
+		logrus.Errorf("new GVRs: %v", newGVRs)
+		logrus.Infof("stopping controllers for GVR %s", removeGVR.String())
+		cancelFunc()
+		delete(s.controllerCancels, removeGVR)
+		delete(s.controllers, removeGVR)
+	}
+
+	return nil
 }

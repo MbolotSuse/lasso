@@ -32,6 +32,7 @@ type SharedClientFactory interface {
 	IsNamespaced(gvk schema.GroupVersionKind) (bool, error)
 	ResourceForGVK(gvk schema.GroupVersionKind) (schema.GroupVersionResource, bool, error)
 	IsHealthy(ctx context.Context) bool
+	RestConfig() *rest.Config
 }
 
 type sharedClientFactory struct {
@@ -201,6 +202,10 @@ func (s *sharedClientFactory) getClient(gvr schema.GroupVersionResource) *Client
 	s.createLock.RLock()
 	defer s.createLock.RUnlock()
 	return s.clients[gvr]
+}
+
+func (s *sharedClientFactory) RestConfig() *rest.Config {
+	return s.config
 }
 
 func populateConfig(scheme *runtime.Scheme, config *rest.Config) (*rest.Config, time.Duration) {
